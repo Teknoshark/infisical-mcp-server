@@ -1,13 +1,18 @@
 #!/usr/bin/env node
 
 import { InfisicalSDK } from "@infisical/sdk";
+import crypto from "crypto";
 import fs from "fs";
+import http from "http";
 import axios from "axios";
 import path from "path";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import {
+  CallToolRequest,
   CallToolRequestSchema,
+  CallToolResult,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
@@ -16,6 +21,17 @@ enum InfisicalAuthMethod {
   UniversalAuth = "universal-auth",
   TokenAuth = "access-token",
 }
+
+enum McpTransport {
+  Stdio = "stdio",
+  Http = "http",
+}
+
+const MCP_PATH = "/mcp";
+const HEALTH_PATH = "/health";
+const APP_KEY_HEADER = "app-key";
+const MIN_APP_KEY_LENGTH = 32;
+const MAX_BODY_BYTES = 1024 * 1024;
 
 enum AvailableTools {
   CreateSecret = "create-secret",
@@ -120,6 +136,9 @@ const getEnvironmentVariables = () => {
           return requested as AvailableTools[];
         }),
       INFISICAL_MASK_SECRET_VALUES: stringBoolean(false),
+      MCP_TRANSPORT: z.nativeEnum(McpTransport).default(McpTransport.Stdio),
+      PORT: z.coerce.number().int().min(1).max(65535).default(3000),
+      MCP_APP_KEY: z.string().trim().optional(),
     })
     // validate the env vars on startup to avoid runtime errors
     .superRefine((data, ctx) => {
@@ -155,6 +174,17 @@ const getEnvironmentVariables = () => {
           });
           break;
       }
+
+      // over HTTP the app key is the only thing standing between the network and the secrets
+      if (
+        data.MCP_TRANSPORT === McpTransport.Http &&
+        (data.MCP_APP_KEY ?? "").length < MIN_APP_KEY_LENGTH
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `MCP_TRANSPORT is http, but MCP_APP_KEY is not set or is shorter than ${MIN_APP_KEY_LENGTH} characters`,
+        });
+      }
     })
     .parse(process.env);
 
@@ -162,33 +192,74 @@ const getEnvironmentVariables = () => {
 };
 
 const env = getEnvironmentVariables();
-let isAuthenticated = false;
 const infisicalSdk = new InfisicalSDK({
   siteUrl: env.INFISICAL_HOST_URL,
 });
 
-const handleAuthentication = async () => {
-  if (isAuthenticated) {
-    return;
+// the SDK takes the site URL; direct API calls need the /api base
+const getApiUrl = () => {
+  let hostUrl = env.INFISICAL_HOST_URL;
+  if (!hostUrl.endsWith("/api")) {
+    if (hostUrl.endsWith("/")) {
+      hostUrl = hostUrl.slice(0, -1);
+    }
+
+    hostUrl += "/api";
   }
 
+  return hostUrl;
+};
+
+// a universal auth token expires, which a long-running HTTP server will outlive.
+// the SDK's login() hides expiresIn, so log in directly and hand the SDK the token
+let tokenExpiresAt = 0;
+let pendingLogin: Promise<void> | undefined;
+
+const universalAuthLogin = async () => {
+  try {
+    const res = await axios.post<{ accessToken: string; expiresIn: number }>(
+      `${getApiUrl()}/v1/auth/universal-auth/login`,
+      {
+        clientId: env.INFISICAL_UNIVERSAL_AUTH_CLIENT_ID,
+        clientSecret: env.INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET,
+      },
+    );
+
+    infisicalSdk.auth().accessToken(res.data.accessToken);
+    // renew at 90% of the lifetime so a request never goes out on a dying token
+    tokenExpiresAt = Date.now() + res.data.expiresIn * 900;
+  } catch (err) {
+    // the request config carries the client secret, so never rethrow the axios error
+    const message = axios.isAxiosError(err)
+      ? `${err.response?.status ?? "no response"} ${err.response?.data?.message ?? err.message}`
+      : (err as Error).message;
+    throw new Error(`Universal auth login failed: ${message}`);
+  }
+};
+
+const handleAuthentication = async () => {
   switch (env.INFISICAL_AUTH_METHOD) {
     case InfisicalAuthMethod.UniversalAuth:
-      await infisicalSdk.auth().universalAuth.login({
-        clientId: env.INFISICAL_UNIVERSAL_AUTH_CLIENT_ID!,
-        clientSecret: env.INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET!,
+      if (Date.now() < tokenExpiresAt) {
+        return;
+      }
+
+      // concurrent HTTP requests share one login
+      pendingLogin ??= universalAuthLogin().finally(() => {
+        pendingLogin = undefined;
       });
+      await pendingLogin;
       break;
     case InfisicalAuthMethod.TokenAuth:
-      infisicalSdk.auth().accessToken(env.INFISICAL_TOKEN!);
+      if (!infisicalSdk.auth().getAccessToken()) {
+        infisicalSdk.auth().accessToken(env.INFISICAL_TOKEN!);
+      }
       break;
     default:
       throw new Error(
         `Unsupported authentication method: ${env.INFISICAL_AUTH_METHOD}`,
       );
   }
-
-  isAuthenticated = true;
 };
 
 const maskSecret = <T extends { secretValue?: string }>(secret: T): T => {
@@ -198,18 +269,6 @@ const maskSecret = <T extends { secretValue?: string }>(secret: T): T => {
 
   return { ...secret, secretValue: MASKED_VALUE };
 };
-
-const server = new Server(
-  {
-    name: "Infisical",
-    version: packageJson.version,
-  },
-  {
-    capabilities: {
-      tools: {},
-    },
-  },
-);
 
 const createSecretSchema = {
   zod: z.object({
@@ -688,15 +747,17 @@ const allCapabilities = [
 const isToolEnabled = (name: string) =>
   env.INFISICAL_ENABLED_TOOLS.includes(name as AvailableTools);
 
-server.setRequestHandler(ListToolsRequestSchema, async () => {
+const handleListTools = async () => {
   return {
     tools: allCapabilities.filter((capability) =>
       isToolEnabled(capability.name),
     ),
   };
-});
+};
 
-server.setRequestHandler(CallToolRequestSchema, async (req) => {
+const handleCallTool = async (
+  req: CallToolRequest,
+): Promise<CallToolResult> => {
   try {
     const { name, arguments: args } = req.params;
 
@@ -933,15 +994,6 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       const accessToken = infisicalSdk.auth().getAccessToken();
 
       try {
-        let hostUrl = env.INFISICAL_HOST_URL;
-        if (!hostUrl.endsWith("/api")) {
-          if (hostUrl.endsWith("/")) {
-            hostUrl = hostUrl.slice(0, -1);
-          }
-
-          hostUrl += "/api";
-        }
-
         // the API has no "all" type; omitting the filter returns every project
         const typeQuery =
           data.type === "all" ? "" : `?type=${encodeURIComponent(data.type)}`;
@@ -960,7 +1012,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
               id: string;
             }[];
           }[];
-        }>(`${hostUrl}/v1/workspace${typeQuery}`, {
+        }>(`${getApiUrl()}/v1/workspace${typeQuery}`, {
           headers: {
             Authorization: `Bearer ${accessToken}`,
           },
@@ -1009,9 +1061,162 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
     throw err;
   }
-});
+};
+
+// a Server binds to one transport, so stateless HTTP builds one per request
+const createServer = () => {
+  const server = new Server(
+    {
+      name: "Infisical",
+      version: packageJson.version,
+    },
+    {
+      capabilities: {
+        tools: {},
+      },
+    },
+  );
+
+  server.setRequestHandler(ListToolsRequestSchema, handleListTools);
+  server.setRequestHandler(CallToolRequestSchema, handleCallTool);
+
+  return server;
+};
+
+const sendJson = (res: http.ServerResponse, status: number, body: unknown) => {
+  res.writeHead(status, { "Content-Type": "application/json" }).end(
+    JSON.stringify(body),
+  );
+};
+
+const sendJsonRpcError = (
+  res: http.ServerResponse,
+  status: number,
+  message: string,
+) => {
+  sendJson(res, status, {
+    jsonrpc: "2.0",
+    error: { code: -32000, message },
+    id: null,
+  });
+};
+
+// hash both sides so timingSafeEqual gets equal lengths and leaks nothing about the key
+const isAppKeyValid = (header: string | string[] | undefined) => {
+  if (typeof header !== "string") return false;
+
+  const digest = (value: string) =>
+    crypto.createHash("sha256").update(value).digest();
+
+  return crypto.timingSafeEqual(digest(header), digest(env.MCP_APP_KEY!));
+};
+
+const readJsonBody = (req: http.IncomingMessage) =>
+  new Promise<unknown>((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+
+    req.on("data", (chunk: Buffer) => {
+      size += chunk.length;
+      if (size > MAX_BODY_BYTES) {
+        reject(new Error("Request body too large"));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on("end", () => {
+      try {
+        resolve(JSON.parse(Buffer.concat(chunks).toString("utf-8")));
+      } catch {
+        reject(new Error("Request body is not valid JSON"));
+      }
+    });
+    req.on("error", reject);
+  });
+
+const handleHttpRequest = async (
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+) => {
+  const { pathname } = new URL(req.url ?? "/", "http://localhost");
+
+  if (pathname === HEALTH_PATH) {
+    sendJson(res, 200, { status: "ok" });
+    return;
+  }
+
+  if (pathname !== MCP_PATH) {
+    sendJson(res, 404, { error: "Not found" });
+    return;
+  }
+
+  if (!isAppKeyValid(req.headers[APP_KEY_HEADER])) {
+    console.error(`Rejected request with a missing or invalid ${APP_KEY_HEADER} header`);
+    sendJsonRpcError(res, 401, "Unauthorized");
+    return;
+  }
+
+  // stateless: no sessions, so there is no GET stream to open or session to DELETE
+  if (req.method !== "POST") {
+    res.setHeader("Allow", "POST");
+    sendJsonRpcError(res, 405, "Method not allowed");
+    return;
+  }
+
+  let body: unknown;
+  try {
+    body = await readJsonBody(req);
+  } catch (err) {
+    sendJsonRpcError(res, 400, (err as Error).message);
+    return;
+  }
+
+  const server = createServer();
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: undefined,
+    enableJsonResponse: true,
+  });
+  res.on("close", () => {
+    transport.close();
+    server.close();
+  });
+
+  await server.connect(transport);
+  await transport.handleRequest(req, res, body);
+};
+
+const startHttpServer = () => {
+  const httpServer = http.createServer((req, res) => {
+    handleHttpRequest(req, res).catch((err) => {
+      console.error(`Error handling MCP request: ${(err as Error).message}`);
+      if (!res.headersSent) {
+        sendJsonRpcError(res, 500, "Internal server error");
+      }
+    });
+  });
+
+  httpServer.listen(env.PORT, () => {
+    console.error(
+      `Infisical MCP Server listening on port ${env.PORT}, path ${MCP_PATH} ✅`,
+    );
+  });
+
+  // as PID 1 in a container node has no default SIGTERM handler
+  const shutdown = () => {
+    httpServer.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 10_000).unref();
+  };
+  process.on("SIGTERM", shutdown);
+  process.on("SIGINT", shutdown);
+};
 
 (async () => {
-  await server.connect(new StdioServerTransport());
+  if (env.MCP_TRANSPORT === McpTransport.Http) {
+    startHttpServer();
+    return;
+  }
+
+  await createServer().connect(new StdioServerTransport());
   console.error("Infisical MCP Server running on stdio ✅");
 })();

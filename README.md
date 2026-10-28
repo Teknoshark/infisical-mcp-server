@@ -62,6 +62,17 @@ Add the following to your `claude_desktop_config.json`. See [here](https://model
 }
 ```
 
+## Running as a remote server
+
+Set `MCP_TRANSPORT=http` to serve [Streamable HTTP](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports#streamable-http) instead of stdio. The server is stateless: each `POST /mcp` is handled on its own, and `GET /health` returns `{"status":"ok"}` without authentication.
+
+- `MCP_TRANSPORT`: `stdio` (default) or `http`.
+- `PORT`: the port to listen on in HTTP mode. Defaults to `3000`.
+- `MCP_APP_KEY`: required in HTTP mode, at least 32 characters. Every request to `/mcp` must send it in an `app-key` header, or it gets a `401`. Generate one with `openssl rand -hex 32`.
+The `Dockerfile` builds an image that runs in HTTP mode on port 3000. Put it behind a TLS-terminating reverse proxy, since the app key travels in a header.
+
+Universal auth tokens are renewed automatically before they expire, so a long-running server keeps working.
+
 ## Available tools
 
 | Tool                        | Description                             |
